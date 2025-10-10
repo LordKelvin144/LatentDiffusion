@@ -4,7 +4,7 @@ from torch import nn
 from typing import Tuple, Optional
 
 
-class _ContractingBlock(nn.Module):
+class _UnetContractingBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, bottom: bool = False):
         super().__init__()
         assert out_channels > in_channels
@@ -35,7 +35,7 @@ class _ContractingBlock(nn.Module):
         return skip_output, down_sampled
 
 
-class _ExpandingBlock(nn.Module):
+class _UnetExpandingBlock(nn.Module):
     def __init__(self, channels: int, include_upsample: bool = True, skip_connections: bool = True):
         super().__init__()
 
@@ -73,14 +73,14 @@ class UNet(nn.Module):
     def __init__(self, in_channels: int, start_channels: int, n_blocks: int = 5):
         super().__init__()
         self.contracting_blocks = nn.ModuleList(
-            [_ContractingBlock(in_channels, start_channels)] + 
-            [_ContractingBlock(start_channels*2**i, start_channels*2**(i+1)) for i in range(n_blocks-2)] +
-            [_ContractingBlock(start_channels*2**(n_blocks-2), start_channels*2**(n_blocks-1), bottom=True)]
+            [_UnetContractingBlock(in_channels, start_channels)] + 
+            [_UnetContractingBlock(start_channels*2**i, start_channels*2**(i+1)) for i in range(n_blocks-2)] +
+            [_UnetContractingBlock(start_channels*2**(n_blocks-2), start_channels*2**(n_blocks-1), bottom=True)]
         )
         self.expanding_blocks = nn.ModuleList(
-            [_ExpandingBlock(channels=start_channels*2**(n_blocks-1), skip_connections=False)] +
-            [_ExpandingBlock(channels=start_channels*2**i) for i in range(n_blocks-2, 0, -1)] + 
-            [_ExpandingBlock(channels=start_channels, include_upsample=False)]
+            [_UnetExpandingBlock(channels=start_channels*2**(n_blocks-1), skip_connections=False)] +
+            [_UnetExpandingBlock(channels=start_channels*2**i) for i in range(n_blocks-2, 0, -1)] + 
+            [_UnetExpandingBlock(channels=start_channels, include_upsample=False)]
         )
         self.final = torch.nn.Conv2d(start_channels, in_channels, kernel_size=1)
 
@@ -100,50 +100,6 @@ class UNet(nn.Module):
         return output
 
 
-class AutoEncoder(nn.Module):
-    def __init__(self, in_channels: int, start_channels: int, n_blocks: int = 5):
-        super().__init__()
-        self.contracting_blocks = nn.ModuleList(
-            [_ContractingBlock(in_channels, start_channels)] + 
-            [_ContractingBlock(start_channels*2**i, start_channels*2**(i+1)) for i in range(n_blocks-2)] +
-            [_ContractingBlock(start_channels*2**(n_blocks-2), start_channels*2**(n_blocks-1), bottom=True)]
-        )
-        self.expanding_blocks = nn.ModuleList(
-            [_ExpandingBlock(channels=start_channels*2**(n_blocks-1), skip_connections=False)] +
-            [_ExpandingBlock(channels=start_channels*2**i, skip_connections=False) for i in range(n_blocks-2, 0, -1)] + 
-            [_ExpandingBlock(channels=start_channels, include_upsample=False, skip_connections=False)]
-        )
-        self.final = torch.nn.Conv2d(start_channels, in_channels, kernel_size=1)
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        :parameter x: Image data of shape (batch, in_channels, height, width)
-        :returns z: Encoded data of shape (batch, z_channels, z_height, z_width)
-        """
-        to_contract: Optional[torch.Tensor] = x
-        for block in self.contracting_blocks:
-            skip_value, to_contract = block(to_contract)
-        assert to_contract is None
-
-        return skip_value  # pyright: ignore
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        :parameter z: Encoded data of shape (batch, z_channels, z_height, z_width)
-        :returns x: Recovered image data of shape (batch, in_channels, height, width)
-        """
-        skip_input = z
-        expanded_input: Optional[torch.Tensor] = None
-        for i, block in enumerate(self.expanding_blocks):
-            if i == 0:
-                skip_input = z
-            else:
-                skip_input = None
-            expanded_input = block(skip_input=skip_input, expanded_input=expanded_input)
-        output = self.final(expanded_input)
-        return output
-
-
 def _test_unet():
     data = torch.randn(10, 5, 256, 256)
     model = UNet(in_channels=5, start_channels=16, n_blocks=4)
@@ -151,15 +107,5 @@ def _test_unet():
     assert data_prime.shape == data.shape
 
 
-def _test_autoencoder():
-    data = torch.randn(10, 5, 256, 256)
-    model = AutoEncoder(in_channels=5, start_channels=16, n_blocks=4)
-    z = model.encode(data)
-    x = model.decode(z)
-    assert x.shape == data.shape
-
-
 if __name__ == '__main__':
     _test_unet()
-    _test_autoencoder()
-

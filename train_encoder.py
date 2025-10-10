@@ -2,12 +2,14 @@ import torch
 from torchvision.datasets import CelebA
 from torchvision.transforms.v2 import Normalize, ToImage, ToDtype, Compose, RandomHorizontalFlip, RandomCrop
 from torch.utils.data import Dataset, DataLoader, Subset
+#from torch.optim.lr_scheduler import CyclicLR
 
 import numpy as np
 
 from dataclasses import dataclass
 
-from encoder import UNet, AutoEncoder
+from autoencoder import AutoEncoder
+#from autoencoder_old import AutoEncoder
 
 from typing import Tuple
 import matplotlib.pyplot as plt
@@ -49,8 +51,7 @@ def train_denoising(train_set: Dataset, val_set: Dataset, training_config: Train
 
     train_loader = DataLoader(train_set, batch_size=training_config.batch, shuffle=True)
 
-    model = AutoEncoder(in_channels=3, start_channels=32, n_blocks=3).to(device)
-    print([param for param in model.parameters()])
+    model = AutoEncoder(data_channels=3, base_channels=32, n_blocks=3).to(device)
 
     optimizer = torch.optim.Adam(params=model.parameters(), lr=training_config.lr)
     losses = []
