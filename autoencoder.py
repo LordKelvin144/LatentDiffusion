@@ -1,7 +1,9 @@
 import torch
 from torch import nn
 
-from typing import Tuple, Optional
+import pathlib
+
+from typing import Tuple, Optional, Dict, Any
 
 
 class _ConvBlock(nn.Module):
@@ -85,6 +87,8 @@ class AutoEncoder(nn.Module):
         self.decoder = Decoder(data_channels=data_channels, base_channels=base_channels, n_blocks=n_blocks)
 
         self.data_channels = data_channels
+        self.base_channels = base_channels
+        self.n_blocks = n_blocks
         self.compression_factor = self.encoder.compression_factor
         self.latent_channels = base_channels * self.compression_factor
 
@@ -104,6 +108,37 @@ class AutoEncoder(nn.Module):
         :returns z: Encoded data of shape (batch, z_channels, z_height, z_width)
         """
         return self.encoder(x)
+
+    def save(self, path: pathlib.Path, metadata: Optional[Dict[str, Any]] = None):
+        from safetensors.torch import save_file
+        if metadata is None:
+            metadata = dict()
+        constructor_metadata = {
+            "data_channels": str(self.data_channels),
+            "base_channels": str(self.base_channels),
+            "n_blocks": str(self.n_blocks),
+        }
+        all_metadata = {key: str(value) for key, value in metadata.items()} | constructor_metadata
+        save_file(self.state_dict(), path, metadata=all_metadata)
+
+    @classmethod
+    def load(cls, path: pathlib.Path) -> 'AutoEncoder':
+        from safetensors import safe_open
+
+        state_dict = {}
+        kwargs = {}
+        kwarg_keys = {"data_channels", "base_channels", "n_blocks"}
+        with safe_open(path, framework="pt") as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
+
+            metadata = f.metadata()
+            for key in kwarg_keys:
+                kwargs[key] = int(metadata[key])
+    
+        model = cls(**kwargs)
+        model.load_state_dict(state_dict)
+        return model
 
 
 def _test_autoencoder():
