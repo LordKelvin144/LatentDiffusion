@@ -7,7 +7,6 @@ from typing import Tuple, Optional
 class _UnetContractingBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, bottom: bool = False):
         super().__init__()
-        assert out_channels > in_channels
 
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding="same")
         self.relu = nn.ReLU()
@@ -70,22 +69,28 @@ class _UnetExpandingBlock(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels: int, start_channels: int, n_blocks: int = 5):
+    def __init__(self, in_channels: int, base_channels: int, n_blocks: int = 5, out_channels: Optional[int] = None):
         super().__init__()
+        self.in_channels = in_channels
+        self.base_channels = base_channels
+        self.n_blocks = n_blocks
         self.contracting_blocks = nn.ModuleList(
-            [_UnetContractingBlock(in_channels, start_channels)] + 
-            [_UnetContractingBlock(start_channels*2**i, start_channels*2**(i+1)) for i in range(n_blocks-2)] +
-            [_UnetContractingBlock(start_channels*2**(n_blocks-2), start_channels*2**(n_blocks-1), bottom=True)]
+            [_UnetContractingBlock(in_channels, base_channels)] + 
+            [_UnetContractingBlock(base_channels*2**i, base_channels*2**(i+1)) for i in range(n_blocks-2)] +
+            [_UnetContractingBlock(base_channels*2**(n_blocks-2), base_channels*2**(n_blocks-1), bottom=True)]
         )
         self.expanding_blocks = nn.ModuleList(
-            [_UnetExpandingBlock(channels=start_channels*2**(n_blocks-1), skip_connections=False)] +
-            [_UnetExpandingBlock(channels=start_channels*2**i) for i in range(n_blocks-2, 0, -1)] + 
-            [_UnetExpandingBlock(channels=start_channels, include_upsample=False)]
+            [_UnetExpandingBlock(channels=base_channels*2**(n_blocks-1), skip_connections=False)] +
+            [_UnetExpandingBlock(channels=base_channels*2**i) for i in range(n_blocks-2, 0, -1)] + 
+            [_UnetExpandingBlock(channels=base_channels, include_upsample=False)]
         )
-        self.final = torch.nn.Conv2d(start_channels, in_channels, kernel_size=1)
+        self.out_channels = in_channels if out_channels is None else out_channels
+        self.final = torch.nn.Conv2d(base_channels, self.out_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor):
         x_: Optional[torch.Tensor] = x
+        assert x_.shape[1] == self.in_channels
+
         skip_values = []
         for block in self.contracting_blocks:
             skip_value, x_ = block(x_)
@@ -96,13 +101,15 @@ class UNet(nn.Module):
             skip_input = skip_values.pop()
             x_ = block(skip_input=skip_input, expanded_input=x_)
         output = self.final(x_)
-        assert output.shape == x.shape
+        assert output.shape[0] == x.shape[0]
+        assert output.shape[1] == self.out_channels
+        assert output.shape[2:] == x.shape[2:]
         return output
 
 
 def _test_unet():
     data = torch.randn(10, 5, 256, 256)
-    model = UNet(in_channels=5, start_channels=16, n_blocks=4)
+    model = UNet(in_channels=5, base_channels=16, n_blocks=4)
     data_prime = model(data)
     assert data_prime.shape == data.shape
 

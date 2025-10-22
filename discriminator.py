@@ -7,7 +7,7 @@ import pathlib
 from autoencoder import Encoder
 
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 
 class PatchDiscriminator(nn.Module):
@@ -59,7 +59,7 @@ class PatchDiscriminator(nn.Module):
         save_file(self.state_dict(), path, metadata=all_metadata)
 
     @classmethod
-    def load(cls, path: pathlib.Path) -> 'PatchDiscriminator':
+    def load(cls, path: pathlib.Path) -> Tuple['PatchDiscriminator', Dict[str, Any]]:
         from safetensors import safe_open
 
         state_dict = {}
@@ -75,7 +75,7 @@ class PatchDiscriminator(nn.Module):
     
         model = cls(**kwargs)
         model.load_state_dict(state_dict)
-        return model
+        return model, metadata
 
 
 class Discriminator(nn.Module):
