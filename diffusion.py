@@ -76,6 +76,26 @@ def reverse_step(schedule: Schedule, xt: torch.Tensor, t: torch.Tensor, epsilon:
     return x_prev
 
 
+@torch.no_grad()
+def estimate_initial(schedule: Schedule, xt: torch.Tensor, t: torch.Tensor, epsilon: torch.Tensor) -> torch.Tensor:
+    """
+    Takes a noise estimate and computes the estimated previous x_0 from it. Operates on a batch.
+    :argument schedule: The diffusion noise schedule to use
+    :argument xt: A batch of noised data, shape (batch, *data_shape)
+    :argument t: A batch of current times at each image in xt, shape (batch,)
+    :argument epsilon: The (estimated) noise epsilon which has been applied from x0 to xt, shape (batch, *data_shape)
+    :returns x0: Approximation of x0 according to epsilon
+    """
+    batch = xt.shape[0]
+    data_shape = xt.shape[1:]
+
+    # Extract which means and variances are relevant at the given time points
+    alpha_bar = schedule.alpha_bar[t]  # Shape (batch,)
+    alpha_bar = alpha_bar.view(batch, *[1 for _ in range(len(data_shape))])  # Shape (batch, 1, ..., 1); broadcastable with x0
+    x0 = (xt - torch.sqrt(1.0-alpha_bar)*epsilon) / torch.sqrt(alpha_bar)
+    return x0
+
+
 def analytic_epsilon(schedule: Schedule, x0: torch.Tensor, xt: torch.Tensor, t: torch.Tensor):
     batch = x0.shape[0]
     data_shape = xt.shape[1:]
