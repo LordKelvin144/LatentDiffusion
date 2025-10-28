@@ -4,64 +4,7 @@ from torch import nn
 from typing import Tuple, Optional
 import itertools
 
-
-class _ResidualBlock(nn.Module):
-    """
-    A residual block that takes in an input of shape (batch, channels, height, width)
-    and returns an output of shape (batch, out_channels, height, width)
-    """
-
-    def __init__(self, channels: int, in_channels: Optional[int] = None, out_channels: Optional[int] = None,
-                 cond_features: Optional[int] = None,
-                 dropout_rate: float = 0.2):
-        super().__init__()
-
-        out_channels = out_channels if out_channels is not None else channels
-        in_channels = in_channels if in_channels is not None else channels
-        do_project = in_channels != out_channels
-
-        self.skip_connection = nn.Identity() if not do_project else nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-        self.input_stage = nn.Sequential(
-            nn.GroupNorm(8, in_channels),
-            nn.SiLU(),
-            nn.Conv2d(in_channels, channels, kernel_size=3, padding="same")
-        )  # (batch, in_channels, height, width) -> (batch, channels, height, width)
-
-        if cond_features is not None:
-            self.cond_stage = nn.Linear(cond_features, channels)  # (batch, cond_features) -> (batch, channels)
-        else:
-            self.cond_stage = None
-
-        self.output_stage = nn.Sequential(
-            nn.GroupNorm(8, channels),
-            nn.SiLU(),
-            nn.Dropout(p=dropout_rate),
-            nn.Conv2d(channels, out_channels, kernel_size=3, padding="same")
-        )
-        with torch.no_grad():
-            last_conv = self.output_stage[-1]
-            last_conv.weight.detach().mul_(0.001)  # pyright: ignore  # Check if this makes sense: The official implementation zeros this layer, but that causes gradients to vanish
-            last_conv.bias.detach().mul_(0.001) # pyright: ignore 
-
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
-        """
-        Takes in a spatial tensor x and conditioning features and returns output
-        :argument x: Tensor of shape (batch, in_channels, height, width)
-        :argument conditioning: Tensor of shape (batch, cond_features)
-        :returns output: Tensor of shape (batch, out_channels, height, width)
-        """
-        
-
-        hidden = self.input_stage(x)
-        if self.cond_stage is not None:
-            assert cond is not None
-            cond_hidden = self.cond_stage(cond)  # shape (batch, channels)
-            cond_hidden = cond_hidden.view(*cond_hidden.shape, *(1 for _ in range(hidden.ndim - cond_hidden.ndim)))
-            hidden += cond_hidden
-        else:
-            assert cond is None
-        return self.output_stage(hidden) + self.skip_connection(x)
+from residual_block import ResidualBlock
 
 
 class ConditionedSequential(nn.Module):
@@ -75,7 +18,7 @@ class ConditionedSequential(nn.Module):
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
         for module in self.layers:
-            if isinstance(module, _ResidualBlock):
+            if isinstance(module, ResidualBlock):
                 x = module(x, cond)
             else:
                 x = module(x)
@@ -115,7 +58,7 @@ class UNet(nn.Module):
                 block_out = block_channels if block_i < n_blocks-1 else base_channels*out_multiplier
 
                 blocks.append(
-                    _ResidualBlock(channels=block_channels, out_channels=block_out, 
+                    ResidualBlock(channels=block_channels, out_channels=block_out, 
                                    dropout_rate=dropout_rate, cond_features=cond_features)
                 )
             skip_channels.append(block_out)  # pyright: ignore
@@ -127,9 +70,9 @@ class UNet(nn.Module):
 
         # Construct the middle stage
         self.middle_stage = ConditionedSequential(
-            _ResidualBlock(channels=base_channels*multipliers[-1], cond_features=cond_features, dropout_rate=dropout_rate), 
+            ResidualBlock(channels=base_channels*multipliers[-1], cond_features=cond_features, dropout_rate=dropout_rate), 
             # TODO: Add attention here
-            _ResidualBlock(channels=base_channels*multipliers[-1], cond_features=cond_features, dropout_rate=dropout_rate)
+            ResidualBlock(channels=base_channels*multipliers[-1], cond_features=cond_features, dropout_rate=dropout_rate)
         )
 
         # Construct the expanding stage
@@ -144,7 +87,7 @@ class UNet(nn.Module):
                 block_in = block_channels if block_i > 0 else base_channels*in_multiplier + skip_channels.pop()
 
                 blocks.append(
-                    _ResidualBlock(channels=block_channels, in_channels=block_in, 
+                    ResidualBlock(channels=block_channels, in_channels=block_in, 
                                    dropout_rate=dropout_rate, cond_features=cond_features)
                 )
 
@@ -198,75 +141,6 @@ class UNet(nn.Module):
         return out
 
 
-def _test_residual_block():
-    batch = 10
-    cond_features = 64
-    resolution = 256
-    in_channels = 3
-    channels = 16
-    out_channels = 2
-
-    # Test case where in_channels != out_channels
-    block = _ResidualBlock(channels, in_channels=in_channels, out_channels=out_channels, cond_features=cond_features)
-
-    conditioning = torch.randn(batch, cond_features)
-    data = torch.randn(batch, in_channels, resolution, resolution)
-
-    output = block(data, conditioning)
-    assert output.shape == (batch, out_channels, resolution, resolution)
-
-    # Test case where in_channels = out_channels
-    out_channels = 3
-    block = _ResidualBlock(channels, in_channels=in_channels, out_channels=out_channels, cond_features=cond_features)
-
-    conditioning = torch.randn(batch, cond_features)
-    data = torch.randn(batch, in_channels, resolution, resolution)
-
-    output = block.forward(data, conditioning)
-    assert output.shape == (batch, out_channels, resolution, resolution)
-
-
-def _debug_resblock():
-    batch = 1
-    cond_features = 64
-    resolution = 4
-    in_channels = 3
-    channels = 16
-    out_channels = 3
-
-    in_layer = nn.Conv2d(in_channels, channels, 1)
-    block = _ResidualBlock(channels, cond_features=None)
-    final = nn.Conv2d(channels, out_channels, 1)
-
-    #conditioning = torch.randn(batch, cond_features, requires_grad=True)
-    data = torch.randn(batch, in_channels, resolution, resolution, requires_grad=True)
-
-    hidden1 = in_layer(data)
-    hidden1.retain_grad()
-    hidden2 = block(hidden1, cond=None)
-    hidden2.retain_grad()
-    output = final(hidden2)
-    output.retain_grad()
-
-    metric = output.sum()
-    metric.backward()
-
-    print("data:", data.grad.norm(2))
-    print("hidden1:", hidden1.grad.norm(2))
-    print("hidden2:", hidden2.grad.norm(2))
-    print("output:", output.grad.norm(2))
-    #print("conditioning:", conditioning.grad.norm(2))
-    #print("conitioning:", conditioning.grad.norm(2))
-
-    print("")
-    for name, param in block.named_parameters():
-        if param.grad is not None:
-            print(name, param.grad.norm(2))
-
-    print("")
-    print(output[0])
-
-
 def _test_unet():
     import numpy as np
     import matplotlib.pyplot as plt
@@ -295,7 +169,7 @@ def _test_unet():
     optimizer = torch.optim.SGD(net.parameters(), lr=0.001)
 
     losses = []
-    for it in range(20000):
+    for it in range(1000):
         output = net(data)
         
         true_target = torch.randn_like(data)
@@ -310,11 +184,10 @@ def _test_unet():
         losses.append(loss.item())
         if it % 10 == 0:
             print(np.mean(losses[-10:]))
-        if it % 1000 == 0:
-            plt.plot(losses)
-            plt.xlabel("iterations")
-            plt.ylabel("loss")
-            plt.show()
+    plt.plot(losses)
+    plt.xlabel("iterations")
+    plt.ylabel("loss")
+    plt.show()
 
 
 if __name__ == '__main__':
