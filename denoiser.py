@@ -8,15 +8,17 @@ from unet import UNet
 from schedule import Schedule
 
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 
 class TimeEncoder(nn.Module):
-    def __init__(self, n_steps: int):
+    def __init__(self, n_steps: int, n_features: int = 4):
         super().__init__()
 
-        wavelengths = [4**i for i in range(1, int(math.ceil(math.log(n_steps, 4))) + 1)]
-        self._omega = nn.Parameter(2*math.pi / torch.tensor(wavelengths), requires_grad=False)
+        wavelengths = torch.logspace(math.log(math.pi), math.log(math.pi*n_steps), n_features // 2, base=math.e)
+        print(wavelengths)
+
+        self._omega = nn.Parameter(2*math.pi / wavelengths, requires_grad=False)
 
     @property
     def n_features(self) -> int:
@@ -37,16 +39,23 @@ class TimeEncoder(nn.Module):
 
 
 class Denoiser(nn.Module):
-    def __init__(self, schedule: Schedule, data_channels: int, base_channels: int):
+    def __init__(self, schedule: Schedule, data_channels: int, base_channels: int,
+                 down_sample: Tuple[bool, ...] = (True, False, True, False),
+                 multipliers: Tuple[int, ...] = (1, 2, 3, 4),
+                 dropout_rate=0.05):
         super().__init__()
 
         self.schedule = schedule
         self.data_channels = data_channels
-        self.time_encoder = TimeEncoder(n_steps=schedule.n_steps)
-        self.unet = UNet(data_channels + self.time_encoder.n_features, 
-                         base_channels,
-                         out_channels=data_channels,
-                         n_blocks=2)
+        self.time_encoder = TimeEncoder(n_steps=schedule.n_steps, n_features=8)
+        #self.unet = UNet(data_channels + self.time_encoder.n_features, 
+                         #base_channels,
+                         #out_channels=data_channels,
+                         #n_blocks=2)
+        self.unet = UNet(in_channels=data_channels, base_channels=base_channels,
+                         down_sample=down_sample,
+                         multipliers=multipliers,
+                         dropout_rate=dropout_rate, cond_features=self.time_encoder.n_features)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor):
         """
@@ -56,24 +65,28 @@ class Denoiser(nn.Module):
         :returns epsilon: The predicted epsilon noise to recover x0, shape (batch, img_channels, height, width)
         """
         time_encoding = self.time_encoder(t)  # Shape (batch, time_features)
-        batch, time_features = time_encoding.shape
 
-        chunk_size = 2**(self.unet.n_blocks - 1)
-        
-        pad_height = pad_width = 0
-        if x.shape[2] % chunk_size != 0:
-            pad_height = chunk_size - x.shape[2] % chunk_size
-        if x.shape[3] % chunk_size != 0:
-            pad_width = chunk_size - x.shape[3] % chunk_size
-
-        x_padded = nn.functional.pad(x, pad=(0, pad_width, 0, pad_height))
-
-        time_channels = time_encoding[..., None, None].broadcast_to((batch, time_features, x_padded.shape[2], x_padded.shape[3]))
-
-        unet_input = torch.cat((x_padded, time_channels), dim=1)
-        epsilon_prediction = self.unet(unet_input)[:, :, :x.shape[2], :x.shape[3]]
+        epsilon_prediction = self.unet.forward(x, time_encoding)
         assert epsilon_prediction.shape == x.shape
         return epsilon_prediction
+
+    @torch.no_grad()
+    def generate(self, img_shape: Tuple[int, int], batch_size: int) -> torch.Tensor:
+        """
+        Generates random batch_size samples from the distribution.
+        :argument img_shape: Shape of images
+        :argument batch_size: Number of samples
+        :returns samples: Tensor of shape (batch, img_channels, *img_shape)
+        """
+        from diffusion import reverse_step
+
+        x = torch.randn(batch_size, self.data_channels, *img_shape, device=self.schedule.beta.device)
+        for t in range(self.schedule.n_steps, 0, -1):
+            ts = torch.tensor([t for _ in range(batch_size)], dtype=torch.int, device=self.schedule.beta.device)
+
+            noise_prediction = self(x, ts)
+            x = reverse_step(self.schedule, xt=x, t=ts, epsilon=noise_prediction)
+        return x
 
     def save(self, path: pathlib.Path, metadata: Optional[Dict[str, Any]] = None):
         from safetensors.torch import save_file
@@ -81,12 +94,16 @@ class Denoiser(nn.Module):
             metadata = dict()
         
         constructor_metadata = {
-            "n_steps": str(self.schedule.n_steps),
-            "schedule_name": str(self.schedule.name()),
+            "schedule.n_steps": str(self.schedule.n_steps),
+            "schedule.name": str(self.schedule.name()),
             "data_channels": str(self.data_channels),
             "base_channels": str(self.unet.base_channels),
-            "n_blocks": str(self.unet.n_blocks),
+            "unet.multipliers": str(self.unet.multipliers),
+            "unet.down_sample": str(self.unet.down_sample),
+            "unet.n_blocks": str(self.unet.n_blocks),
+            "unet.dropout_rate": str(self.unet.dropout_rate)
         }
+
         all_metadata = {key: str(value) for key, value in metadata.items()} | constructor_metadata
         save_file(self.state_dict(), path, metadata=all_metadata)
 
@@ -101,25 +118,32 @@ class Denoiser(nn.Module):
     
             metadata = f.metadata()
 
-        if schedule.name() != metadata["schedule_name"]:
+        if schedule.name() != metadata["schedule.name"]:
             raise ValueError("Tried loading a diffuser model with an incompatible schedule. "
                              f"Loaded schedule has name {metadata['schedule_name']}, "
                              f"but reference schedule has name {schedule.name()}.")
-        if schedule.n_steps != int(metadata["n_steps"]):
+        if schedule.n_steps != int(metadata["schedule.n_steps"]):
             raise ValueError("Tried loading a diffuser model with an incompatible schedule. "
                              f"Loaded schedule has n_steps={metadata['n_steps']}, "
                              f"but reference schedule has name {schedule.n_steps}.")
+
+        multipliers = tuple(int(el.strip()) for el in metadata["unet.multipliers"][1:-1].split(","))
+        down_sample = tuple(el.strip() == "True" for el in metadata["unet.down_sample"][1:-1].split(","))
+        print(f"{multipliers = }, {down_sample = }")
         model = Denoiser(schedule=schedule, 
                          data_channels=int(metadata["data_channels"]),
-                         base_channels=int(metadata["base_channels"]))
+                         base_channels=int(metadata["base_channels"]),
+                         down_sample=down_sample,
+                         multipliers=multipliers,
+                         dropout_rate=float(metadata["unet.dropout_rate"]))
         model.load_state_dict(state_dict)
         return model
         
 
 def _test_time_encoding():
     import matplotlib.pyplot as plt
-    times = torch.arange(16)
-    encoder = TimeEncoder(n_steps=16)
+    times = torch.arange(32)
+    encoder = TimeEncoder(n_steps=32, n_features=8)
     time_encoded = encoder(times)
 
     fig, axs = plt.subplots(int(time_encoded.shape[1]), 1, sharex=True)

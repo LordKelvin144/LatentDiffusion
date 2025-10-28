@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, Subset
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ChainedScheduler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ChainedScheduler, StepLR
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -25,7 +25,8 @@ class TrainingConfig:
     batch: int
     lr: float
     epochs: int
-    warmup_steps: int = 1000
+    denoiser_channels: int
+    warmup_steps: int = 200
     warmup_factor: float = 0.1
     cosine_annealing_steps: int = 1_000_000
     cosine_annealing_factor: float = 0.1
@@ -90,13 +91,13 @@ class TrainingCallback(ABC):
             return
 
         if self.step_interval is not None and step % self.step_interval == 0 and step != 0:
-            self(epoch, step)
+            self(epoch, step, batches_per_epoch)
 
         elif self.step_interval is None and step == batches_per_epoch - 1:
-            self(epoch, step)
+            self(epoch, step, batches_per_epoch)
 
     @abstractmethod
-    def __call__(self, epoch: int, step: int) -> None:
+    def __call__(self, epoch: int, step: int, batches_per_epoch: int) -> None:
         pass
 
 
@@ -105,8 +106,9 @@ class PrintLossCallback(TrainingCallback):
         super().__init__(epoch_interval=epoch_interval, step_interval=step_interval)
         self._logger = logger
 
-    def __call__(self, epoch: int, step: int) -> None:
-        print(self._logger.current_repr())
+    def __call__(self, epoch: int, step: int, batches_per_epoch: int) -> None:
+        window = self.step_interval if self.step_interval is not None else batches_per_epoch*self.epoch_interval
+        print(self._logger.current_repr(window))
 
 
 class PlotLossCallback(TrainingCallback):
@@ -115,7 +117,7 @@ class PlotLossCallback(TrainingCallback):
         self._logger = logger
         self._filename = filename
 
-    def __call__(self, epoch: int, step: int) -> None:
+    def __call__(self, epoch: int, step: int, batches_per_epoch: int) -> None:
         self._logger.plot()
         plt.xscale("log")
         if self._filename is not None:
@@ -138,12 +140,15 @@ class PlotPredictionsCallback(TrainingCallback):
         else:
             self._image_source = image_source
 
-    def __call__(self, epoch: int, step: int) -> None:
+    def __call__(self, epoch: int, step: int, batches_per_epoch: int) -> None:
         if isinstance(self._image_source, torch.Tensor):
             x0 = self._image_source
         else:
             x0 = next(self._image_source)[0].to(self._schedule.beta.device)  # TODO: Make this cleaner
+        was_training = self._denoiser.training
+        self._denoiser.eval()
         plot_denoiser_predictions(x0=x0, schedule=self._schedule, autoencoder=self._autoencoder, denoiser=self._denoiser)
+        self._denoiser.train(was_training)
 
         if self._filename is not None:
             plt.savefig(self._filename, dpi=300)
@@ -158,7 +163,7 @@ class SaveModelCallback(TrainingCallback):
         self._file_prefix = pathlib.Path(file_prefix)
         self._denoiser = denoiser
 
-    def __call__(self, epoch: int, step: int) -> None:
+    def __call__(self, epoch: int, step: int, batches_per_epoch: int) -> None:
         model_path = self._file_prefix.parent / (self._file_prefix.name + f"_epoch{epoch}.safetensors")
         print(f"Saving denoiser checkpoint to {model_path} ...")
         self._denoiser.save(model_path, metadata={"epoch": epoch, "step": step})
@@ -166,7 +171,6 @@ class SaveModelCallback(TrainingCallback):
 
 @torch.no_grad()
 def plot_denoiser_predictions(x0: torch.Tensor, schedule: Schedule, denoiser: Denoiser, autoencoder: AutoEncoder):
-
     n = x0.shape[0]
     z0 = autoencoder.encode(x0)
     t = torch.linspace(1, schedule.n_steps // 2, n, dtype=torch.int, device=z0.device)
@@ -206,6 +210,19 @@ def plot_denoiser_predictions(x0: torch.Tensor, schedule: Schedule, denoiser: De
         axs[i,3].imshow(xv_recon[i])
 
 
+@torch.no_grad()
+def illustrate_generation(denoiser: Denoiser, autoencoder: AutoEncoder):
+    import matplotlib.pyplot as plt
+    z0 = denoiser.generate(img_shape=(27, 22), batch_size=15)
+    x0 = autoencoder.decode(z0)
+    x_denorm = denormalize(x0.detach().cpu())
+    
+    fig, axs = plt.subplots(5, 3, figsize=(6, 8))
+    for i in range(15):
+        axs.flatten()[i].imshow(x_denorm[i])
+        axs.flatten()[i].axis("off")
+
+
 def train_latent_denoiser(denoiser: Denoiser, 
                           autoencoder: AutoEncoder,
                           schedule: Schedule,
@@ -220,9 +237,12 @@ def train_latent_denoiser(denoiser: Denoiser,
 
     optimizer = torch.optim.Adam(params=denoiser.parameters(), lr=config.lr)
     lr_schedule = ChainedScheduler([LinearLR(optimizer, start_factor=config.warmup_factor, total_iters=config.warmup_steps),
-                                    CosineAnnealingLR(optimizer, T_max=config.cosine_annealing_steps, eta_min=config.lr*config.cosine_annealing_factor)],
+                                    #StepLR(optimizer, step_size=10000, gamma=0.5),
+                                    CosineAnnealingLR(optimizer, T_max=config.cosine_annealing_steps, eta_min=config.lr*config.cosine_annealing_factor)
+                                    ],
                                    optimizer=optimizer)
 
+    denoiser.train()
     for epoch in range(config.epochs):
         step_i = 0
         for step_i, (x0, _) in enumerate(train_loader):
@@ -230,18 +250,27 @@ def train_latent_denoiser(denoiser: Denoiser,
             x0 = x0.to(device)
             with torch.no_grad():
                 z0 = autoencoder.encode(x0)  # Shape (batch, z_channels, z_height, z_width)
+            del x0
 
             # Get noised examples and their corresponding times and epsilons
-            zt, t, epsilon = sample_training_examples(schedule, z0)
+            t = torch.randint(low=1, high=schedule.n_steps+1, size=(z0.shape[0],), device=schedule.beta.device)
+            zt, epsilon = forward_process(schedule, z0, t)
 
             # Get model prediction
-            epsilon_prediction = denoiser(zt, t)  # Shape (batch, z_channels, z_height, z_width)
+            #epsilon_prediction = denoiser(zt, t)  # Shape (batch, z_channels, z_height, z_width)
+            epsilon_prediction = denoiser(zt, t)
 
             loss = torch.square(epsilon_prediction - epsilon).mean()
 
             optimizer.zero_grad()
             loss.backward()
 
+            if logger._iteration % 100 == 0:
+                for name, param in denoiser.named_parameters():
+                    if param.requires_grad:
+                        #print(name, param.grad.norm(2).cpu().item())
+                        pass
+                #print("\n")
             nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
 
             optimizer.step()
@@ -253,11 +282,52 @@ def train_latent_denoiser(denoiser: Denoiser,
                 callback.check(epoch, step_i, len(train_loader))
 
 
-def main():
+def grid_search():
     train_set, val_set = make_celeba(savedir="/ml/data")
-    #train_set = Subset(train_set, indices=list(range(128)))
+    #train_set = Subset(train_set, indices=list(range(10000)))
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    schedule = LinearSchedule(beta_start=1e-4, beta_end=0.02, n_steps=1000, device=device)
+    autoencoder, _meatadata = AutoEncoder.load(pathlib.Path("checkpoints/autoencoder/v3.safetensors"))
+    autoencoder = autoencoder.to(device)
+
+    configs = [
+        TrainingConfig(batch=32, lr=0.0001, denoiser_channels=channels, epochs=4) for channels in [64, 128, 256]
+    ]
+
+    for config_i, config in enumerate(configs):
+        print(f"Config {config_i}/{len(configs)}: {config}")
+
+        denoiser = Denoiser(schedule=schedule, 
+                            data_channels=autoencoder.latent_channels, 
+                            base_channels=config.denoiser_channels,
+                            dropout_rate=0.5).to(device)
+
+        logger = TrainLogger(window=100, log_vars={"loss": "loss"})
+        callbacks: List[TrainingCallback] = [
+            PrintLossCallback(logger, step_interval=1000),
+            PlotLossCallback(logger, epoch_interval=config.epochs-1, filename=f"fig/diffusion/gridsearch/loss__lr{config.lr}__ch{config.denoiser_channels}.png"),
+            #PlotPredictionsCallback(image_source=DataLoader(val_set, batch_size=5, shuffle=False), autoencoder=autoencoder, denoiser=denoiser, schedule=schedule, filename="fig/diffusion/predictions.png", 
+                                    #step_interval=1000),
+            #SaveModelCallback(denoiser, file_prefix="checkpoints/denoiser/temp", epoch_interval=1)
+        ]
+
+        train_latent_denoiser(denoiser=denoiser, 
+                              autoencoder=autoencoder,
+                              schedule=schedule,
+                              train_set=train_set,
+                              val_set=val_set,
+                              config=config,
+                              logger=logger,
+                              callbacks=callbacks)
+
+def train():
+    train_set, val_set = make_celeba(savedir="/ml/data")
+    #train_set = Subset(train_set, indices=list(range(2048)))
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    training_config = TrainingConfig(batch=64, lr=0.0001, epochs=10000, denoiser_channels=64)
 
     schedule = LinearSchedule(beta_start=1e-4, beta_end=0.02, n_steps=1000, device=device)
     autoencoder, _meatadata = AutoEncoder.load(pathlib.Path("checkpoints/autoencoder/v3.safetensors"))
@@ -265,18 +335,21 @@ def main():
 
     denoiser = Denoiser(schedule=schedule, 
                         data_channels=autoencoder.latent_channels, 
-                        base_channels=128).to(device)
+                        base_channels=training_config.denoiser_channels,
+                        multipliers=(1,2,4,4,6),
+                        down_sample=(False,False,False,False,True),
+                        dropout_rate=0.2)
+    denoiser = denoiser.to(device)
 
     logger = TrainLogger(window=100, log_vars={"loss": "loss"})
     callbacks: List[TrainingCallback] = [
-        PrintLossCallback(logger, step_interval=100),
+        PrintLossCallback(logger, step_interval=250),
         PlotLossCallback(logger, step_interval=500, filename="fig/diffusion/losses.png"),
         PlotPredictionsCallback(image_source=DataLoader(val_set, batch_size=5, shuffle=False), autoencoder=autoencoder, denoiser=denoiser, schedule=schedule, filename="fig/diffusion/predictions.png", 
                                 step_interval=1000),
         SaveModelCallback(denoiser, file_prefix="checkpoints/denoiser/temp", epoch_interval=1)
     ]
 
-    training_config = TrainingConfig(batch=64, lr=0.0001, epochs=10000)
     train_latent_denoiser(denoiser=denoiser, 
                           autoencoder=autoencoder,
                           schedule=schedule,
@@ -287,6 +360,23 @@ def main():
                           callbacks=callbacks)
 
 
+def showcase_trained():
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    schedule = LinearSchedule(beta_start=1e-4, beta_end=0.02, n_steps=1000, device=device)
+    autoencoder, _meatadata = AutoEncoder.load(pathlib.Path("checkpoints/autoencoder/v3.safetensors"))
+    autoencoder = autoencoder.to(device)
+
+    #denoiser_path = pathlib.Path("checkpoints/denoiser/v5.safetensors")
+    denoiser_path = pathlib.Path("checkpoints/denoiser/new_epoch14_loss_0_034.safetensors")
+    denoiser = Denoiser.load(denoiser_path, schedule).to(device)
+    denoiser.eval()
+
+    illustrate_generation(denoiser, autoencoder)
+    plt.savefig("fig/diffusion/generated.png", dpi=300)
+    plt.show()
+
+
 if __name__ == '__main__':
-    main()
+    train()
+    #showcase_trained()
 

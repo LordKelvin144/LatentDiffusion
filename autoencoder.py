@@ -2,6 +2,7 @@ import torch
 from torch import nn
 
 import pathlib
+import hashlib
 
 from typing import Tuple, Optional, Dict, Any
 
@@ -257,6 +258,19 @@ class AutoEncoder(nn.Module):
                             stochastic=bool(metadata["stochastic"]))
         model.load_state_dict(state_dict)
         return model, metadata
+
+    def sha256_digest(self) -> str:
+        import hashlib
+        hasher = hashlib.sha256()
+        for name, tensor in self.state_dict().items():
+            if not name.startswith('param'):
+                continue
+        
+            hasher.update(name.encode('utf-8'))
+            # Ensure consistent dtype + endianness before hashing
+            hasher.update(tensor.cpu().numpy().tobytes(order='C'))
+    
+        return hasher.hexdigest()
 
 
 def _test_autoencoder():
