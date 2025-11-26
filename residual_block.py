@@ -4,6 +4,24 @@ from torch import nn
 from typing import Optional
 
 
+class ConditionedSequential(nn.Module):
+    """
+    A utility module behaving similar to nn.Sequential but which passes conditioning to modules that expects it.
+    """
+
+    def __init__(self, *layers: nn.Module):
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
+        for module in self.layers:
+            if isinstance(module, ResidualBlock):
+                x = module(x, cond)
+            else:
+                x = module(x)
+        return x
+
+
 class ResidualBlock(nn.Module):
     """
     A residual block that takes in an input of shape (batch, channels, height, width)
@@ -23,7 +41,7 @@ class ResidualBlock(nn.Module):
 
         self.input_stage = nn.Sequential(
             nn.GroupNorm(8, in_channels),
-            nn.SiLU(),
+            nn.SiLU(inplace=True),
             nn.Conv2d(in_channels, channels, kernel_size=3, padding="same")
         )  # (batch, in_channels, height, width) -> (batch, channels, height, width)
 
@@ -34,7 +52,7 @@ class ResidualBlock(nn.Module):
 
         self.output_stage = nn.Sequential(
             nn.GroupNorm(8, channels),
-            nn.SiLU(),
+            nn.SiLU(inplace=True),
             nn.Dropout(p=dropout_rate),
             nn.Conv2d(channels, out_channels, kernel_size=3, padding="same")
         )
@@ -50,14 +68,12 @@ class ResidualBlock(nn.Module):
         :argument conditioning: Tensor of shape (batch, cond_features)
         :returns output: Tensor of shape (batch, out_channels, height, width)
         """
-        
 
         hidden = self.input_stage(x)
         if self.cond_stage is not None:
             assert cond is not None
             cond_hidden = self.cond_stage(cond)  # shape (batch, channels)
-            cond_hidden = cond_hidden.view(*cond_hidden.shape, *(1 for _ in range(hidden.ndim - cond_hidden.ndim)))
-            hidden += cond_hidden
+            hidden += cond_hidden.view(*cond_hidden.shape, *(1 for _ in range(hidden.ndim - cond_hidden.ndim)))
         else:
             assert cond is None
         return self.output_stage(hidden) + self.skip_connection(x)

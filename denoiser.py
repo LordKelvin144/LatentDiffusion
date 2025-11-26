@@ -12,10 +12,10 @@ from typing import Optional, Dict, Any, Tuple
 
 
 class TimeEncoder(nn.Module):
-    def __init__(self, n_steps: int, n_features: int = 4):
+    def __init__(self, n_steps: int, n_features: int = 6):
         super().__init__()
 
-        wavelengths = torch.logspace(math.log(math.pi), math.log(math.pi*n_steps), n_features // 2, base=math.e)
+        wavelengths = torch.logspace(math.log(8), math.log(2*n_steps), n_features // 2, base=math.e)
         print(wavelengths)
 
         self._omega = nn.Parameter(2*math.pi / wavelengths, requires_grad=False)
@@ -47,7 +47,7 @@ class Denoiser(nn.Module):
 
         self.schedule = schedule
         self.data_channels = data_channels
-        self.time_encoder = TimeEncoder(n_steps=schedule.n_steps, n_features=8)
+        self.time_encoder = TimeEncoder(n_steps=schedule.n_steps, n_features=12)
         #self.unet = UNet(data_channels + self.time_encoder.n_features, 
                          #base_channels,
                          #out_channels=data_channels,
@@ -108,7 +108,7 @@ class Denoiser(nn.Module):
         save_file(self.state_dict(), path, metadata=all_metadata)
 
     @classmethod
-    def load(cls, path: pathlib.Path, schedule: Schedule) -> 'Denoiser':
+    def load(cls, path: pathlib.Path, schedule: Schedule) -> Tuple['Denoiser', Dict[str, str]]:
         from safetensors import safe_open
 
         state_dict = {}
@@ -137,13 +137,13 @@ class Denoiser(nn.Module):
                          multipliers=multipliers,
                          dropout_rate=float(metadata["unet.dropout_rate"]))
         model.load_state_dict(state_dict)
-        return model
+        return model, metadata
         
 
 def _test_time_encoding():
     import matplotlib.pyplot as plt
-    times = torch.arange(32)
-    encoder = TimeEncoder(n_steps=32, n_features=8)
+    times = torch.arange(1000)
+    encoder = TimeEncoder(n_steps=1000, n_features=12)
     time_encoded = encoder(times)
 
     fig, axs = plt.subplots(int(time_encoded.shape[1]), 1, sharex=True)
@@ -152,6 +152,47 @@ def _test_time_encoding():
     plt.show()
 
 
+def _test_toy_problem():
+    data_channels = 3
+    resolution = 64
+    batch = 16
+    corrupt = False  # Try substituting true time with random corrupted time to see drop in performance -> show model actually *uses* time conditioning
+
+    from schedule import LinearSchedule
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    schedule = LinearSchedule(beta_start=1e-4, beta_end=0.02, n_steps=1000, device=device)
+
+    denoiser = Denoiser(schedule, data_channels=data_channels, base_channels=64).to(device)
+
+    data = torch.randn(batch, data_channels, resolution, resolution, device=device)
+    stationary_target = torch.randn(batch, data_channels, resolution, resolution, device=device)
+
+    # Create a toy objective where a time step is sampled and it is used as a linear parameter controlling a mix between target and 0
+    optimizer = torch.optim.Adam(denoiser.parameters(), lr=0.0001)
+
+    print(f"{corrupt = }")
+
+    for iteration in range(2000):
+        t_true = torch.randint(low=0, high=schedule.n_steps+1, size=(batch,), device=device)
+        if corrupt:
+            t = torch.randint(low=0, high=schedule.n_steps+1, size=(batch,), device=device)
+        else:
+            t = t_true
+        mix_param = t_true/schedule.n_steps
+
+        target = data + (stationary_target - data)*mix_param[:, None, None, None]
+        prediction = denoiser(data, t)
+        loss = torch.square(prediction - target).mean()
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if iteration % 100 == 0:
+            print(loss.item())
+
+
 if __name__ == '__main__':
-    _test_time_encoding()
+    #_test_time_encoding()
+    _test_toy_problem()
 

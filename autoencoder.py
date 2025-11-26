@@ -1,10 +1,14 @@
 import torch
 from torch import nn
+from torch.utils.data import Dataset
+from torchvision.io import decode_image
 
 import pathlib
-import hashlib
+import itertools
 
 from typing import Tuple, Optional, Dict, Any
+
+from residual_block import ResidualBlock, ConditionedSequential
 
 
 class NormalDistribution:
@@ -67,30 +71,50 @@ class _ConvBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, data_channels: int, base_channels: int, n_blocks: int = 3, latent_channels: Optional[int] = None, stochastic: bool = True):
+    def __init__(self, 
+                 data_channels: int, 
+                 base_channels: int, 
+                 down_sample: Tuple[bool, ...],
+                 multipliers: Tuple[int, ...], 
+                 n_blocks: int = 2, 
+                 latent_channels: Optional[int] = None,
+                 stochastic: bool = True,
+                 dropout_rate=0.2):
         super().__init__()
         
         self.data_channels = data_channels
-        self.compression_factor = 2**(n_blocks - 1)
         self.stochastic = stochastic
+        self.down_sampling_factor = 2**sum(down_sample)
+        
+        self.input_projection = nn.Conv2d(data_channels, base_channels, 1)
 
-        layers = []
-        channels = base_channels
-        for i in range(n_blocks):
-            if i == 0:
-                layers.append(_ConvBlock(in_channels=data_channels, channels=channels))
-            else:
-                layers.append(_ConvBlock(in_channels=channels // 2, channels=channels))
-            
-            if i != n_blocks - 1:
-                layers.append(nn.MaxPool2d(2, 2))
-                channels = 2*channels
+        layer_edge_channels = multipliers + (multipliers[-1],)
+
+        # Construct the contracting stage
+        layers = [] 
+        for layer_i, (in_multiplier, out_multiplier) in enumerate(itertools.pairwise(layer_edge_channels)):
+            for block_i in range(n_blocks):
+                block_channels = base_channels*in_multiplier
+                block_out = block_channels if block_i < n_blocks-1 else base_channels*out_multiplier
+
+                layers.append(
+                    ResidualBlock(channels=block_channels, out_channels=block_out, 
+                                   dropout_rate=dropout_rate, cond_features=None)
+                )
+
+            if down_sample[layer_i]:
+                layers.append(nn.MaxPool2d(2, 2))  # Downsample 2x
+
+        self.contracting_stage = ConditionedSequential(*layers)
     
-        self.latent_channels = latent_channels if latent_channels is not None else channels
-        self.compression_stage = nn.Sequential(*layers)
+        self.latent_channels = latent_channels if latent_channels is not None else base_channels*multipliers[-1]
 
         output_channels = self.latent_channels if not stochastic else 2*self.latent_channels
-        self.final = nn.Conv2d(channels, output_channels, 1)
+        self.final = nn.Sequential(
+            nn.GroupNorm(8, base_channels*multipliers[-1]),
+            nn.SiLU(),
+            nn.Conv2d(base_channels*multipliers[-1], output_channels, 1)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mean, _log_std = self._forward_computation(x)
@@ -99,10 +123,11 @@ class Encoder(nn.Module):
     def _forward_computation(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert x.ndim == 4
         assert x.shape[1] == self.data_channels
-        assert x.shape[2] % self.compression_factor == 0 and x.shape[3] % self.compression_factor == 0
+        assert x.shape[2] % self.down_sampling_factor == 0 and x.shape[3] % self.down_sampling_factor == 0
 
-        # If we have tried to encode this value previously, retrieve cached value
-        output = self.final(self.compression_stage(x))
+        h = self.input_projection(x)
+        h = self.contracting_stage(h, cond=None)
+        output = self.final(h)
         if self.stochastic:
             mean = output[:, :self.latent_channels, :, :]
             log_std = output[:, self.latent_channels:, :, :]
@@ -126,35 +151,57 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, data_channels: int, base_channels: int, latent_channels: int, n_blocks: int = 3, stochastic: bool = True):
+    def __init__(self, 
+                 data_channels: int, 
+                 base_channels: int, 
+                 latent_channels: int,
+                 down_sample: Tuple[bool, ...],
+                 multipliers: Tuple[int, ...], 
+                 n_blocks: int = 2, 
+                 stochastic: bool = True,
+                 dropout_rate: float = 0.2):
         super().__init__()
 
         self.stochastic = stochastic
         self.data_channels = data_channels
-        self.compression_factor = 2**(n_blocks - 1)
+        self.down_sampling_factor = 2**sum(down_sample)
         self.latent_channels = latent_channels
         self.base_channels = base_channels
 
+        layer_edge_channels = multipliers + (multipliers[-1],)
+
+        self.input_projection = nn.Conv2d(latent_channels, self.base_channels*multipliers[-1], 1)
+
         layers = []
-        channels = self.base_channels * 2**(n_blocks-1)
-        for i in range(n_blocks):
-            in_channels = latent_channels if i == 0 else None
+        for layer_i, (out_multiplier, in_multiplier) in reversed(list(enumerate(itertools.pairwise(layer_edge_channels)))):
+            if down_sample[layer_i]:
+                layers.append(nn.Upsample(scale_factor=2))
 
-            layers.append(_ConvBlock(channels=channels, in_channels=in_channels))
-            
-            if i != n_blocks - 1:
-                layers += [nn.ConvTranspose2d(channels, channels // 2, kernel_size=2, stride=2), nn.ReLU()]
-                channels = channels // 2
+            for block_i in range(n_blocks):
+                block_channels = base_channels*out_multiplier
+                block_in = block_channels if block_i > 0 else base_channels*in_multiplier
 
-        self.expansion_stage = nn.Sequential(*layers)
+                layers.append(
+                    ResidualBlock(channels=block_channels, in_channels=block_in, 
+                                  dropout_rate=dropout_rate, cond_features=None)
+                )
+
+        self.expanding_stage = ConditionedSequential(*layers)
+
         output_channels = 2*data_channels if stochastic else data_channels
-        self.final = nn.Conv2d(channels, output_channels, kernel_size=1)
+        self.final = nn.Sequential(
+            nn.GroupNorm(8, base_channels),
+            nn.SiLU(),
+            nn.Conv2d(base_channels, output_channels, kernel_size=1)
+        )
 
     def _forward_computation(self, z: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert z.ndim == 4
         assert z.shape[1] == self.latent_channels
 
-        output = self.final(self.expansion_stage(z))
+        h = self.input_projection(z)
+        h = self.expanding_stage(h, cond=None)
+        output = self.final(h)
 
         if self.stochastic:
             mean = output[:, :self.data_channels, :, :]
@@ -188,20 +235,43 @@ class Decoder(nn.Module):
 
 
 class AutoEncoder(nn.Module):
-    def __init__(self, data_channels: int, base_channels: int, n_blocks: int = 3, latent_channels: Optional[int] = None, stochastic: bool = True):
+    def __init__(self, 
+                 data_channels: int,
+                 base_channels: int,
+                 down_sample: Tuple[bool, ...],
+                 multipliers: Tuple[int, ...], 
+                 n_blocks: int = 2,
+                 latent_channels: Optional[int] = None,
+                 stochastic: bool = True,
+                 dropout_rate: float = 0.2):
         super().__init__()
-        self.encoder = Encoder(data_channels=data_channels, base_channels=base_channels, n_blocks=n_blocks, 
-                               latent_channels=latent_channels, stochastic=stochastic)
+        self.encoder = Encoder(data_channels=data_channels, 
+                               base_channels=base_channels, 
+                               down_sample=down_sample,
+                               multipliers=multipliers,
+                               n_blocks=n_blocks, 
+                               latent_channels=latent_channels,
+                               stochastic=stochastic,
+                               dropout_rate=dropout_rate)
         self.latent_channels = self.encoder.latent_channels
-        self.decoder = Decoder(data_channels=data_channels, base_channels=base_channels,
-                               latent_channels=self.latent_channels, n_blocks=n_blocks, stochastic=stochastic)
+        self.decoder = Decoder(data_channels=data_channels,
+                               base_channels=base_channels,
+                               down_sample=down_sample,
+                               multipliers=multipliers,
+                               n_blocks=n_blocks,
+                               latent_channels=self.latent_channels,
+                               stochastic=stochastic,
+                               dropout_rate=dropout_rate)
 
         self.stochastic = stochastic
         self.data_channels = data_channels
         self.base_channels = base_channels
         self.n_blocks = n_blocks
-        self.compression_factor = self.encoder.compression_factor
+        self.multipliers = multipliers
+        self.down_sample = down_sample
+        self.down_sampling_factor = self.encoder.down_sampling_factor
         self.latent_channels = self.encoder.latent_channels
+        self.dropout_rate = dropout_rate
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(x))
@@ -233,9 +303,12 @@ class AutoEncoder(nn.Module):
         constructor_metadata = {
             "data_channels": str(self.data_channels),
             "base_channels": str(self.base_channels),
+            "down_sample": str(self.down_sample),
+            "multipliers": str(self.multipliers),
             "n_blocks": str(self.n_blocks),
             "latent_channels": str(self.latent_channels),
-            "stochastic": str(self.stochastic)
+            "stochastic": str(self.stochastic),
+            "dropout_rate": str(self.dropout_rate)
         }
         all_metadata = {key: str(value) for key, value in metadata.items()} | constructor_metadata
         save_file(self.state_dict(), path, metadata=all_metadata)
@@ -251,11 +324,17 @@ class AutoEncoder(nn.Module):
     
             metadata = f.metadata()
 
+        print(metadata)
+        multipliers = tuple(int(el.strip()) for el in metadata["multipliers"][1:-1].split(","))
+        down_sample = tuple(el.strip() == "True" for el in metadata["down_sample"][1:-1].split(","))
         model = AutoEncoder(data_channels=int(metadata["data_channels"]),
                             base_channels=int(metadata["base_channels"]),
+                            down_sample=down_sample,
+                            multipliers=multipliers,
                             n_blocks=int(metadata["n_blocks"]),
                             latent_channels=int(metadata["latent_channels"]),
-                            stochastic=bool(metadata["stochastic"]))
+                            stochastic=bool(metadata["stochastic"]),
+                            dropout_rate=float(metadata["dropout_rate"]))
         model.load_state_dict(state_dict)
         return model, metadata
 
@@ -263,28 +342,107 @@ class AutoEncoder(nn.Module):
         import hashlib
         hasher = hashlib.sha256()
         for name, tensor in self.state_dict().items():
-            if not name.startswith('param'):
-                continue
-        
             hasher.update(name.encode('utf-8'))
-            # Ensure consistent dtype + endianness before hashing
             hasher.update(tensor.cpu().numpy().tobytes(order='C'))
     
         return hasher.hexdigest()
 
 
+class EncodedImgDataset(Dataset):
+    """
+    A dataset which wraps an autoencoder applied to a set of images.
+    Fetching at an index returns the encoded version of the image at the index.
+    Optionally, the encoded images can be cached (though beware that this uses significant disk space).
+    """
+    
+    def __init__(self, dataset: Dataset, autoencoder: AutoEncoder, directory: pathlib.Path | str = pathlib.Path("./encoded_img")):
+        print(f"Creating EncodedImgDataset with autoencoder {autoencoder.sha256_digest()}")
+        super().__init__()
+        self._base_dataset = dataset
+        self._autoencoder = autoencoder
+        assert not self._autoencoder.training
+
+        self._device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+        self._len = len(dataset)  # pyright: ignore
+        self._directory = pathlib.Path(directory) / autoencoder.sha256_digest()
+        if not self._directory.exists():
+            print(f"Created directory for encoded images at {self._directory}")
+            self._directory.mkdir()
+
+        self._chunk_size = 16
+        with torch.no_grad():
+            img, label = dataset[0]
+            img = img.to(self._device)
+            self._latent_shape = autoencoder.encode(img[None, ...]).shape[1:]
+            self._label_shape = label.shape
+        self._filled_idx = set()
+
+    def _get_chunk(self, i: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        path = self._directory / (str(i).zfill(6)+".pt")
+        label_path = self._directory / (str(i).zfill(6) + ".label.pt")
+
+        if path.exists():
+            return torch.load(path), torch.load(label_path)
+
+        img = torch.zeros(self._chunk_size, *self._latent_shape, dtype=torch.float16)
+        label = torch.zeros(self._chunk_size, *self._label_shape, dtype=torch.float16)
+        return img, label
+
+    def _save_chunk(self, i: int, img: torch.Tensor, label: torch.Tensor):
+        path = self._directory / (str(i).zfill(6)+".pt")
+        label_path = self._directory / (str(i).zfill(6) + ".label.pt")
+        torch.save(img, path)
+        torch.save(label, label_path)
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        chunk_i = idx // self._chunk_size
+        sub_i = idx % self._chunk_size
+        batch_img, batch_label = self._get_chunk(chunk_i)
+
+        if idx not in self._filled_idx:
+            img, label = self._base_dataset[idx]
+            with torch.no_grad():
+                batch_img[sub_i] = self._autoencoder.encode(img.to(self._device)[None, ...]).cpu().squeeze(0)
+            batch_label[sub_i] = label
+            self._filled_idx.add(idx)
+            self._save_chunk(chunk_i, batch_img, batch_label)
+
+        return batch_img[sub_i], batch_label[sub_i]
+
+
 def _test_autoencoder():
     data = torch.randn(10, 3, 216, 176)
-    model = AutoEncoder(data_channels=3, base_channels=32, n_blocks=3)
+    model = AutoEncoder(data_channels=3, base_channels=32, down_sample=(True, True, True, False), multipliers=(1, 2, 4, 8), latent_channels=5)
 
-    for name, param in model.named_parameters():
-        print(name, param.shape)
     z = model.encode(data)
     assert z.shape[1] == model.latent_channels
     x = model.decode(z)
     assert x.shape == data.shape
 
 
+def _test_save_load():
+    model = AutoEncoder(data_channels=3, base_channels=32, down_sample=(True, True), multipliers=(1, 2), latent_channels=1)
+    digest = model.sha256_digest()
+
+    path = pathlib.Path("_temp_autoencoder.safetensors")
+
+    try:
+        model.save(path, metadata={"foo": "bar"})
+        loaded_model, metadata = AutoEncoder.load(path)
+    finally:
+        if path.exists():
+            path.unlink()
+
+    assert loaded_model.sha256_digest() == digest
+    assert metadata["foo"] == "bar"
+
+
 if __name__ == '__main__':
     _test_autoencoder()
+    _test_save_load()
+    print("Tests successful!")
 

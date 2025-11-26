@@ -4,25 +4,9 @@ from torch import nn
 from typing import Tuple, Optional
 import itertools
 
-from residual_block import ResidualBlock
+from data_utils import chunk_pad, chunk_depad
 
-
-class ConditionedSequential(nn.Module):
-    """
-    A utility module behaving similar to nn.Sequential but which passes conditioning to modules that expects it.
-    """
-
-    def __init__(self, *layers: nn.Module):
-        super().__init__()
-        self.layers = nn.ModuleList(layers)
-
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
-        for module in self.layers:
-            if isinstance(module, ResidualBlock):
-                x = module(x, cond)
-            else:
-                x = module(x)
-        return x
+from residual_block import ResidualBlock, ConditionedSequential
 
 
 class UNet(nn.Module):
@@ -96,25 +80,9 @@ class UNet(nn.Module):
         self.out_channels = in_channels if out_channels is None else out_channels
         self.final = nn.Sequential(
             nn.GroupNorm(4, base_channels),
-            nn.SiLU(),
+            nn.SiLU(inplace=True),
             nn.Conv2d(base_channels, self.out_channels, kernel_size=1)
         )
-
-    def _pad(self, x: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
-        pad_height = pad_width = 0
-        chunk_size = self.down_sampling_factor
-        if x.shape[2] % chunk_size != 0:
-            pad_height = chunk_size - x.shape[2] % chunk_size
-        if x.shape[3] % chunk_size != 0:
-            pad_width = chunk_size - x.shape[3] % chunk_size
-        if pad_height or pad_width:
-            import warnings
-            warnings.warn(f"Input shape {x.shape} is not cleanly divisible using downsampling factor {self.down_sampling_factor}, applying padding ...")
-        x = nn.functional.pad(x, pad=(0, pad_width, 0, pad_height))
-        return x, pad_height, pad_width
-
-    def _depad(self, x: torch.Tensor, pad_height: int, pad_width: int) -> torch.Tensor:
-        return x[:, :, :x.shape[2]-pad_height, :x.shape[3]-pad_width]
 
     def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None):
         """
@@ -122,7 +90,7 @@ class UNet(nn.Module):
         and returns a prediction of shape (batch, out_channels, heigh, width)
         """
         in_shape = x.shape
-        x, pad_height, pad_width = self._pad(x)
+        x, pad_height, pad_width = chunk_pad(x, self.down_sampling_factor)
         h = self.input_projection(x)
 
         hiddens = []
@@ -136,7 +104,7 @@ class UNet(nn.Module):
             h = block(torch.cat([h, hiddens.pop()], dim=1), cond=cond)
 
         out = self.final(h)
-        out = self._depad(out, pad_height, pad_width)
+        out = chunk_depad(out, pad_height, pad_width)
         assert out.shape == in_shape
         return out
 
@@ -144,8 +112,9 @@ class UNet(nn.Module):
 def _test_unet():
     import numpy as np
     import matplotlib.pyplot as plt
+    import time
 
-    batch = 1
+    batch = 16
     cond_features = 64
     resolution = 32
     in_channels = 3
@@ -169,7 +138,8 @@ def _test_unet():
     optimizer = torch.optim.SGD(net.parameters(), lr=0.001)
 
     losses = []
-    for it in range(1000):
+    t_start = time.perf_counter()
+    for it in range(100):
         output = net(data)
         
         true_target = torch.randn_like(data)
@@ -182,8 +152,10 @@ def _test_unet():
         optimizer.step()
 
         losses.append(loss.item())
-        if it % 10 == 0:
+        if it % 100 == 0:
             print(np.mean(losses[-10:]))
+    t_end = time.perf_counter()
+    print(f"Time per step: {(t_end - t_start) / 100 :.3g} s")
     plt.plot(losses)
     plt.xlabel("iterations")
     plt.ylabel("loss")

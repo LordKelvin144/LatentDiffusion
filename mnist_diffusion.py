@@ -6,12 +6,10 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 
 import numpy as np
 
-from autoencoder import AutoEncoder
 from denoiser import Denoiser
 from data_utils import TrainingConfig, make_mnist
-from diffusion import sample_training_examples, reverse_step
+from diffusion import forward_process, reverse_step, DiffusionLossTracker
 from schedule import Schedule, LinearSchedule
-
 
 import pathlib
 
@@ -56,7 +54,7 @@ def illustrate_generation(denoiser: Denoiser):
         axs.flatten()[i].imshow(x_denorm[i])
 
 
-def train_denoiser(schedule: Schedule, train_set: MNIST, val_set: MNIST, training_config: TrainingConfig):
+def train_denoiser(schedule: Schedule, train_set: MNIST, training_config: TrainingConfig):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     train_loader = DataLoader(train_set, batch_size=training_config.batch, shuffle=True, drop_last=True)
@@ -64,23 +62,29 @@ def train_denoiser(schedule: Schedule, train_set: MNIST, val_set: MNIST, trainin
     denoiser = Denoiser(schedule=schedule, 
                         data_channels=1, 
                         base_channels=64).to(device)
-    denoiser = Denoiser.load(pathlib.Path("checkpoints/mnist/v1.safetensors"), schedule=schedule).to(device)
+    #denoiser, _ = Denoiser.load(pathlib.Path("checkpoints/mnist/v1.safetensors"), schedule=schedule)
+    denoiser = denoiser.to(device)
 
     optimizer = torch.optim.Adam(params=denoiser.parameters(), lr=training_config.lr)
     scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=50)
 
     losses = []
+    loss_tracker = DiffusionLossTracker(schedule)
 
     denoiser.train()
     for epoch in range(training_config.epochs):
         for step_i, (x0, _) in enumerate(train_loader):
             x0 = x0.to(device)
-            xt, t, epsilon = sample_training_examples(schedule, x0)
+
+            # Get diffusion sample
+            t = torch.randint(low=1, high=schedule.n_steps+1, size=(x0.shape[0],), device=device)
+            xt, epsilon = forward_process(schedule, x0, t)
 
             # Get model prediction
             epsilon_prediction = denoiser(xt, t)  # Shape (batch, z_channels, z_height, z_width)
 
-            loss = torch.square(epsilon_prediction - epsilon).mean()
+            loss_by_batch = torch.square(epsilon_prediction - epsilon).mean((1, 2, 3))  # Shape batch
+            loss = loss_by_batch.mean()
 
             optimizer.zero_grad()
             loss.backward()
@@ -90,7 +94,16 @@ def train_denoiser(schedule: Schedule, train_set: MNIST, val_set: MNIST, trainin
             optimizer.step()
             scheduler.step()
 
+            loss_tracker.add(t=t, losses=loss_by_batch.detach())
+
             if step_i % 100 == 0:
+                import matplotlib.pyplot as plt
+                # loss_tracker.current_errorbar(nbins=10)
+                loss_tracker.bin_loss_over_time()
+                plt.xscale("log")
+                plt.yscale("log")
+                plt.savefig("fig/mnist/bin_losses.jpg", dpi=200)
+                plt.close()
                 print(f"Step {step_i}; loss={np.mean(losses[-100:]):.4g}")
 
             losses.append(loss.item())
@@ -134,7 +147,8 @@ def showcase_trained():
                               device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
     model_path = pathlib.Path("checkpoints/mnist/v1.safetensors")
 
-    denoiser = Denoiser.load(model_path, schedule).to(device)
+    denoiser, _ = Denoiser.load(model_path, schedule)
+    denoiser = denoiser.to(device)
     denoiser.eval()
     illustrate_generation(denoiser)
     plt.show()
@@ -146,9 +160,10 @@ def train():
     schedule = LinearSchedule(beta_start=1e-4, beta_end=0.02, n_steps=1000,
                               device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
     #train_set = Subset(train_set, indices=list(range(1024)))
-    train_denoiser(schedule, train_set, val_set, training_config=training_config)
+    train_denoiser(schedule, train_set, training_config=training_config)
 
 
 if __name__ == '__main__':
-    showcase_trained()
+    #showcase_trained()
+    train()
 
