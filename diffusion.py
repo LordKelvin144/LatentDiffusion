@@ -160,7 +160,7 @@ class DiffusionLossTracker:
         import matplotlib.pyplot as plt
         bins = np.linspace(0, self._schedule.n_steps, nbins+1)
 
-        iterations = np.linspace(0, self._iterations, self._t.size)
+        iterations = np.linspace(0, self._iterations, self._t.size) + 1
         window = int(window * (self._t.size / self._iterations))
 
         idx = self._t[:, None] <= bins[None, :]  # Shape (iterations, bins+1), t such that t <= bin[j]

@@ -16,7 +16,6 @@ class TimeEncoder(nn.Module):
         super().__init__()
 
         wavelengths = torch.logspace(math.log(8), math.log(2*n_steps), n_features // 2, base=math.e)
-        print(wavelengths)
 
         self._omega = nn.Parameter(2*math.pi / wavelengths, requires_grad=False)
 

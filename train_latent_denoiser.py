@@ -94,7 +94,10 @@ class SaveDenoiserCallback(TrainingCallback):
         self._autoencoder_hash = autoencoder_hash
 
     def __call__(self, epoch: int, step: int, batches_per_epoch: int) -> None:
-        model_path = self._file_prefix.parent / (self._file_prefix.name + f"_epoch{epoch}.safetensors")
+        directory = self._file_prefix.parent
+        if not directory.exists():
+            directory.mkdir(parents=True)
+        model_path = directory / (self._file_prefix.name + f"_epoch{epoch}.safetensors")
         print(f"Saving denoiser checkpoint to {model_path} ...")
         self._denoiser.save(model_path, metadata={"epoch": epoch, "step": step, "autoencoder": self._autoencoder_hash})
 
@@ -205,6 +208,8 @@ def train_latent_denoiser(denoiser: Denoiser,
             loss_per_item = torch.square(epsilon_prediction - epsilon).mean((1, 2, 3))
             loss = loss_per_item.mean()
 
+            optimizer.zero_grad()
+
             loss.backward()
 
             nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
@@ -220,16 +225,17 @@ def train_latent_denoiser(denoiser: Denoiser,
                 callback.check(epoch, step_i, len(train_loader))
 
 
-def train():
-    train_set, val_set = make_celeba(savedir="/ml/data")
-    #train_set = Subset(train_set, indices=list(range(2048*256)))
+def train(args):
+    pathlib.Path("fig/denoiser").mkdir(parents=True, exist_ok=True)
+
+    train_set, val_set = make_celeba(savedir=args.data_root)
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-    training_config = TrainingConfig(batch=64, lr=0.0001, epochs=10000, denoiser_channels=32)
+    training_config = TrainingConfig(batch=args.batch, lr=args.lr, epochs=10000, denoiser_channels=args.channels)
 
     schedule = LinearSchedule(beta_start=1e-4, beta_end=0.02, n_steps=1000, device=device)
-    autoencoder, _meatadata = AutoEncoder.load(pathlib.Path("checkpoints/autoencoder/bigger_6.safetensors"))
+    autoencoder, _meatadata = AutoEncoder.load(args.encoder)
     autoencoder = autoencoder.to(device)
     autoencoder.eval()
 
@@ -239,19 +245,18 @@ def train():
                         multipliers=(1, 2, 3, 4,),
                         down_sample=(False, False, False, True,),
                         dropout_rate=0.2)
-    #denoiser, denoiser_metadata = Denoiser.load(path=pathlib.Path("checkpoints/denoiser/temp_epoch0.safetensors"), schedule=schedule)
-    #assert denoiser_metadata["autoencoder"] == autoencoder.sha256_digest()
     denoiser = denoiser.to(device)
 
     logger = TrainLogger(window=500, log_vars={"loss": "loss"})
     diffusion_loss_tracker = DiffusionLossTracker(schedule)
 
+    # Create callbacks for tracking stats while training
     callbacks: List[TrainingCallback] = [
         PrintLossCallback(logger, step_interval=250),
-        PlotLossCallback(logger, step_interval=250, filename="fig/diffusion/losses.jpg"),
-        PlotPredictionsCallback(image_source=DataLoader(val_set, batch_size=5, shuffle=False), autoencoder=autoencoder, denoiser=denoiser, schedule=schedule, filename="fig/diffusion/predictions.jpg", 
+        PlotLossCallback(logger, step_interval=250, filename="fig/denoiser/losses.jpg"),
+        PlotPredictionsCallback(image_source=DataLoader(val_set, batch_size=5, shuffle=False), autoencoder=autoencoder, denoiser=denoiser, schedule=schedule, filename="fig/denoiser/predictions.jpg", 
                                 step_interval=500),
-        PlotBinnedLossCallback(diffusion_loss_tracker, step_interval=50, filename="fig/diffusion/bin_losses.jpg"),
+        PlotBinnedLossCallback(diffusion_loss_tracker, step_interval=50, filename="fig/denoiser/bin_losses.jpg"),
         SaveDenoiserCallback(denoiser, file_prefix="checkpoints/denoiser/temp", autoencoder_hash=autoencoder.sha256_digest(), epoch_interval=1)
     ]
 
@@ -265,27 +270,52 @@ def train():
                           callbacks=callbacks)
 
 
-def showcase_trained():
+def showcase_trained(args):
+    pathlib.Path("fig/denoiser").mkdir(parents=True, exist_ok=True)
+
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     schedule = LinearSchedule(beta_start=1e-4, beta_end=0.02, n_steps=1000, device=device)
-    autoencoder, _meatadata = AutoEncoder.load(pathlib.Path("checkpoints/autoencoder/v5.safetensors"))
+    autoencoder, _meatadata = AutoEncoder.load(args.encoder)
     autoencoder = autoencoder.to(device)
     autoencoder.eval()
 
-    #denoiser_path = pathlib.Path("checkpoints/denoiser/v5.safetensors")
-    denoiser_path = pathlib.Path("checkpoints/denoiser/epoch4.safetensors")
-    #denoiser_path = pathlib.Path("checkpoints/denoiser/new_epoch14_loss_0_034.safetensors")
-    denoiser, denoiser_metadata = Denoiser.load(denoiser_path, schedule)
-    assert denoiser_metadata["autoencoder"] == autoencoder.sha256_digest()
+    denoiser, denoiser_metadata = Denoiser.load(args.show, schedule)
+
+    # Check that the denoiser was trained with the relevant autoencoder
+    if not denoiser_metadata["autoencoder"] == autoencoder.sha256_digest():
+        raise ValueError(f"The provided autoencoder at {args.encoder} is incompatible with the denoiser at {args.show}\n"
+                         f"The autoencoder has hash digest starting with {autoencoder.sha256_digest()[:8]} but \n"
+                         f"the denoiser was trained with {denoiser_metadata['autoencoder'][:8]}.")
     denoiser.to(device)
     denoiser.eval()
 
     illustrate_generation(denoiser, autoencoder)
-    plt.savefig("fig/diffusion/generated_new.png", dpi=300)
+    plt.savefig("fig/denoiser/generated_new.png", dpi=300)
     plt.show()
 
 
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Training of latent denoisers.")
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--train", action="store_true", help="Flag to train a new model. (default=%(default)s)", default=False)
+    group.add_argument("--show", type=pathlib.Path, help="Path to a trained denoiser checkpoint to showcase. (default=%(default)s)")
+
+    parser.add_argument("-e", "--encoder", type=pathlib.Path, help="Path to trained autoencoder checkpoint", required=True)
+    parser.add_argument("--lr", type=float, help="Learning rate. (default=%(default)s)", default=0.0001)
+    parser.add_argument("--batch", type=int, help="Batch size. (default=%(default)s)", default=32)
+    parser.add_argument("--channels", type=int, help="Base channels for the denoiser. (default=%(default)s)", default=128)
+    parser.add_argument("--data-root", type=pathlib.Path, help="Path to data root directory. (default=%(default)s)", default=pathlib.Path("./data"))
+
+    args = parser.parse_args()
+    if args.train:
+        train(args)
+    else:
+        showcase_trained(args)
+
+
 if __name__ == '__main__':
-    train()
+    main()
     #showcase_trained()
 

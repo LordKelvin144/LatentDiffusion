@@ -134,28 +134,30 @@ def train_denoiser(schedule: Schedule, train_set: MNIST, training_config: Traini
         denoiser.train()
 
         # Save model
-        model_path = pathlib.Path(f"checkpoints/mnist/epoch{epoch}.safetensors")
+        save_dir = pathlib.Path(f"checkpoints/mnist")
+        if not save_dir.exists():
+            save_dir.mkdir(parents=True)
+        model_path = save_dir / f"epoch{epoch}.safetensors"
         print(f"Saving denoiser checkpoint to {model_path} ...")
         denoiser.save(model_path, metadata={"epoch": epoch, "step": step_i})
 
 
-def showcase_trained():
+def showcase_trained(args):
     import matplotlib.pyplot as plt
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     schedule = LinearSchedule(beta_start=1e-4, beta_end=0.02, n_steps=1000,
                               device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-    model_path = pathlib.Path("checkpoints/mnist/v1.safetensors")
 
-    denoiser, _ = Denoiser.load(model_path, schedule)
+    denoiser, _ = Denoiser.load(args.show, schedule)
     denoiser = denoiser.to(device)
     denoiser.eval()
     illustrate_generation(denoiser)
     plt.show()
 
 
-def train():
-    train_set, val_set = make_mnist(savedir="/ml/data")
+def train(args):
+    train_set, val_set = make_mnist(savedir=args.data_root)
     training_config = TrainingConfig(batch=128, lr=0.0001, epochs=10000)
     schedule = LinearSchedule(beta_start=1e-4, beta_end=0.02, n_steps=1000,
                               device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
@@ -163,7 +165,25 @@ def train():
     train_denoiser(schedule, train_set, training_config=training_config)
 
 
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Train a simple diffusion model (not latent diffusion) on MNIST.")
+
+    group = parser.add_mutually_exclusive_group(required=True)
+
+    group.add_argument("--show", type=pathlib.Path, help="Path to a trained checkpoint to use showcase", default=None)
+    group.add_argument("--train", action="store_true", help="Flag to train a new model", default=False)
+    parser.add_argument("--data-root", type=pathlib.Path, help="Path to dataset root (default=%(default)s)", default=pathlib.Path("./data"))
+
+    args = parser.parse_args()
+    if args.train:
+        train(args)
+    elif args.show:
+        showcase_trained(args)
+
+
+
+
 if __name__ == '__main__':
-    #showcase_trained()
-    train()
+    main()
 

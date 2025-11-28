@@ -119,11 +119,19 @@ class SaveModelsCallback(TrainingCallback):
         self._discriminator = discriminator
         self._autoencoder = autoencoder
 
+
     def __call__(self, epoch: int, step: int, batches_per_epoch: int) -> None:
-        model_path = self._autoencoder_file_prefix.parent / (self._autoencoder_file_prefix.name + f"_epoch{epoch}.safetensors")
+        directory = self._autoencoder_file_prefix.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        model_path = directory / (self._autoencoder_file_prefix.name + f"_epoch{epoch}.safetensors")
+
         print(f"Saving autoencoder checkpoint to {model_path} ...")
         self._autoencoder.save(model_path, metadata={"epoch": epoch, "step": step})
+
+        directory = self._discriminator_file_prefix.parent
+        directory.mkdir(parents=True, exist_ok=True)
         discriminator_path = self._discriminator_file_prefix.parent / (self._discriminator_file_prefix.name + f"_epoch{epoch}.safetensors")
+
         print(f"Saving discriminator checkpoint to {discriminator_path} ...")
         self._discriminator.save(discriminator_path, metadata={"epoch": epoch, "step": step})
 
@@ -151,7 +159,7 @@ def train(train_set: Dataset,
             img = img.to(device)
 
             update_auto_encoder = True  # (step_i & 4 == 0)
-            update_discriminator = True  # (step_i & 4 != 0)
+            update_discriminator = (step_i % 2 == 0)  # (step_i & 4 != 0)
 
             if update_auto_encoder:
                 # Freeze discriminator
@@ -176,7 +184,7 @@ def train(train_set: Dataset,
                 kl_loss = z_distribution.kl(reduction="mean").mean(0)
                 
                 # Combine to form overall loss
-                loss = reconstruction_loss + 0.01*kl_loss + 0.025*gan_realism_loss
+                loss = reconstruction_loss + 0.001*kl_loss + 0.025*gan_realism_loss
 
                 # Save losses to logger
                 logger.log(loss=loss.detach(), l2=reconstruction_loss.detach(), kl=kl_loss.detach(), gan=gan_realism_loss.detach())
@@ -214,8 +222,9 @@ def train(train_set: Dataset,
                 callback.check(epoch, step_i, len(train_loader))
 
 
-def main():
-    train_set, val_set = make_celeba(savedir="/ml/data")
+def main(args):
+
+    train_set, val_set = make_celeba(savedir=args.data_root)
     #train_set = Subset(train_set, indices=list(range(1024)))
     training_config = TrainingConfig(batch=16, lr=0.00005, epochs=15)
 
@@ -226,7 +235,7 @@ def main():
                               base_channels=64, 
                               multipliers=(1, 2, 4), 
                               down_sample=(True, True, False),
-                              latent_channels=6, stochastic=True).to(device)
+                              latent_channels=3, stochastic=True).to(device)
     discriminator = PatchDiscriminator(data_channels=3, base_channels=16, multipliers=(1, 2, 4), down_sample=(True, True, True,)).to(device)
 
     callbacks: List[TrainingCallback] = [
@@ -249,5 +258,11 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Train an autoencoder")
+    parser.add_argument("--data-root", type=pathlib.Path, default=pathlib.Path("data"), help="Path to dataset root (default='%(default)s')")
+
+    args = parser.parse_args()
+
+    main(args)
 
