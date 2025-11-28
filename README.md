@@ -1,7 +1,7 @@
 # Latent diffusion (from scratch)
 This project is a reproduction and exploration of the latent diffusion framework introduced in ["High-Resolution Image Synthesis with Latent Diffusion Models"](https://arxiv.org/abs/2112.10752) by Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, Björn Ommer.
 
-The aim is to provide a simple implementation capable of realistic image generation.
+The aim is to provide a simple PyTorch implementation capable of realistic image generation.
 
 Note that this is a work in progress. Currently the code comprises
 - An end-to-end implementation of the latent diffusion pipeline for image generation
@@ -11,13 +11,24 @@ Note that this is a work in progress. Currently the code comprises
 - As a baseline and sanity check, a diffusion-only model for generating MNIST digits.
 
 ## Sample outputs
-![Generated images when training on the CelebA dataset](example_results/generated_faces_epoch8.jpg)
-*Sample generated images from a model trained for 8 epochs on the [CelebA dataset](https://mmlab.ie.cuhk.edu.hk/projects/CelebA.html).
-Training time was short; quality should improve with longer runs*
+<img alt="Generated images when training on the CelebA dataset" width=1000 src="example_results/generated_faces_epoch10.jpg">
 
+Sample generated images from a model trained for 10 epochs on the [CelebA dataset](https://mmlab.ie.cuhk.edu.hk/projects/CelebA.html).
+Training time was short; quality should improve with longer runs.
 
-![Image of generated MNIST digits](example_results/generated_mnist.jpg)
-*Sample outputs from a simple DDPM trained on MNIST*
+<br>
+<br>
+
+<img alt="Generated images when training on the CelebA dataset" width=1000 src="example_results/generated_faces_epoch10__low_sigma.jpg">
+
+Sample from the same model as the previous figure, but using a lower $\sigma$ at each denoising step. Specifically, this result used $\sigma=0.95\sqrt{\beta_t}$ where $\beta_t$ is the schedule variance.
+
+<br>
+<br>
+
+<img alt="Image of generated MNIST digits" width=1000 src="example_results/generated_mnist.jpg">
+
+Sample outputs from a simple DDPM trained on MNIST
 
 ## Overview
 The basic training pipeline consists in the following steps
@@ -33,6 +44,12 @@ At generation time the process is
 3. Decode the latent representation into an image.
 
 ## Running
+
+### Environment
+Install dependencies:
+```bash
+python3 -m pip install -r requirements.txt
+```
 
 ### Baseline diffusion model (MNIST)
 
