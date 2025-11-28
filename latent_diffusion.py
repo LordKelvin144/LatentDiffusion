@@ -150,7 +150,7 @@ def illustrate_generation(denoiser: Denoiser, autoencoder: AutoEncoder):
     x0 = autoencoder.decode(z0)
     x_denorm = denormalize(x0.detach().cpu())
     
-    fig, axs = plt.subplots(5, 3, figsize=(6, 8))
+    fig, axs = plt.subplots(3, 5, figsize=(8, 6), layout="tight")
     for i in range(15):
         axs.flatten()[i].imshow(x_denorm[i])
         axs.flatten()[i].axis("off")
@@ -162,6 +162,7 @@ def train_latent_denoiser(denoiser: Denoiser,
                           train_set: Dataset,
                           config: TrainingConfig,
                           logger: TrainLogger,
+                          start_epoch: int = 0,
                           diffusion_loss_tracker: Optional[DiffusionLossTracker] = None,
                           callbacks: Optional[List[TrainingCallback]] = None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -182,7 +183,7 @@ def train_latent_denoiser(denoiser: Denoiser,
         callbacks = []
 
     denoiser.train()
-    for epoch in range(config.epochs):
+    for epoch in range(start_epoch, config.epochs):
         step_i = 0
         for step_i, (z0, _) in enumerate(tqdm(train_loader)):
             z0 = z0.to(device)
@@ -239,12 +240,21 @@ def train(args):
     autoencoder = autoencoder.to(device)
     autoencoder.eval()
 
-    denoiser = Denoiser(schedule=schedule, 
-                        data_channels=autoencoder.latent_channels, 
-                        base_channels=training_config.denoiser_channels,
-                        multipliers=(1, 2, 3, 4,),
-                        down_sample=(False, False, False, True,),
-                        dropout_rate=0.2)
+    if args.resume is not None:
+        denoiser, denoiser_metadata = Denoiser.load(args.resume, schedule=schedule)
+        if not denoiser_metadata["autoencoder"] == autoencoder.sha256_digest():
+            raise ValueError(f"The provided autoencoder at {args.encoder} is incompatible with the denoiser at {args.show}\n"
+                             f"The autoencoder has hash digest starting with {autoencoder.sha256_digest()[:8]} but \n"
+                             f"the denoiser was trained with {denoiser_metadata['autoencoder'][:8]}.")
+        start_epoch = int(denoiser_metadata["epoch"]) + 1
+    else:
+        denoiser = Denoiser(schedule=schedule, 
+                            data_channels=autoencoder.latent_channels, 
+                            base_channels=training_config.denoiser_channels,
+                            multipliers=(1, 2, 3, 4,),
+                            down_sample=(False, False, False, True,),
+                            dropout_rate=0.2)
+        start_epoch = 0
     denoiser = denoiser.to(device)
 
     logger = TrainLogger(window=500, log_vars={"loss": "loss"})
@@ -266,6 +276,7 @@ def train(args):
                           train_set=train_set,
                           config=training_config,
                           logger=logger,
+                          start_epoch=start_epoch,
                           diffusion_loss_tracker=diffusion_loss_tracker,
                           callbacks=callbacks)
 
@@ -286,11 +297,11 @@ def showcase_trained(args):
         raise ValueError(f"The provided autoencoder at {args.encoder} is incompatible with the denoiser at {args.show}\n"
                          f"The autoencoder has hash digest starting with {autoencoder.sha256_digest()[:8]} but \n"
                          f"the denoiser was trained with {denoiser_metadata['autoencoder'][:8]}.")
-    denoiser.to(device)
+    denoiser = denoiser.to(device)
     denoiser.eval()
 
     illustrate_generation(denoiser, autoencoder)
-    plt.savefig("fig/denoiser/generated_new.png", dpi=300)
+    plt.savefig("fig/denoiser/generated.jpg", dpi=300)
     plt.show()
 
 
@@ -307,6 +318,7 @@ def main():
     parser.add_argument("--batch", type=int, help="Batch size. (default=%(default)s)", default=32)
     parser.add_argument("--channels", type=int, help="Base channels for the denoiser. (default=%(default)s)", default=128)
     parser.add_argument("--data-root", type=pathlib.Path, help="Path to data root directory. (default=%(default)s)", default=pathlib.Path("./data"))
+    parser.add_argument("--resume", type=pathlib.Path, default=None, help="Optional to a denoiser checkpoint. If provided, training will resume from this checkpoint.")
 
     args = parser.parse_args()
     if args.train:

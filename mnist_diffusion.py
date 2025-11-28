@@ -46,12 +46,13 @@ def illustrate_model_on_batch(denoiser: Denoiser, x0: torch.Tensor, xt: torch.Te
 
 def illustrate_generation(denoiser: Denoiser):
     import matplotlib.pyplot as plt
-    x = denoiser.generate(img_shape=(28, 28), batch_size=15).cpu()
+    x = denoiser.generate(img_shape=(28, 28), batch_size=30).cpu()
     x_denorm = x.detach().cpu().squeeze(1)
     
-    fig, axs = plt.subplots(5, 3, figsize=(6, 8))
-    for i in range(15):
+    fig, axs = plt.subplots(5, 6, figsize=(9, 7), layout="tight")
+    for i in range(axs.size):
         axs.flatten()[i].imshow(x_denorm[i])
+        axs.flatten()[i].axis("off")
 
 
 def train_denoiser(schedule: Schedule, train_set: MNIST, training_config: TrainingConfig):
@@ -116,11 +117,11 @@ def train_denoiser(schedule: Schedule, train_set: MNIST, training_config: Traini
         import matplotlib.pyplot as plt
 
         illustrate_model_on_batch(denoiser, x0=x0, xt=xt, t=t)
-        plt.savefig("fig/mnist/predictions.png")
+        plt.savefig("fig/mnist/predictions.jpg")
         plt.close()
 
         illustrate_generation(denoiser)
-        plt.savefig("fig/mnist/generated.png")
+        plt.savefig("fig/mnist/generated.jpg")
         plt.close()
 
         fig, ax = plt.subplots(figsize=(6, 6))
@@ -128,7 +129,7 @@ def train_denoiser(schedule: Schedule, train_set: MNIST, training_config: Traini
         ax.set_xlabel("iteration")
         ax.set_ylabel("loss")
         ax.set_yscale("log")
-        fig.savefig("fig/mnist/losses.png")
+        fig.savefig("fig/mnist/losses.jpg")
         #plt.show()
         plt.close()
         denoiser.train()
@@ -153,6 +154,7 @@ def showcase_trained(args):
     denoiser = denoiser.to(device)
     denoiser.eval()
     illustrate_generation(denoiser)
+    plt.savefig("fig/mnist/generated.jpg")
     plt.show()
 
 
@@ -175,6 +177,7 @@ def main():
     group.add_argument("--train", action="store_true", help="Flag to train a new model", default=False)
     parser.add_argument("--data-root", type=pathlib.Path, help="Path to dataset root (default=%(default)s)", default=pathlib.Path("./data"))
 
+    pathlib.Path("fig/mnist").mkdir(parents=True, exist_ok=True)
     args = parser.parse_args()
     if args.train:
         train(args)

@@ -72,7 +72,7 @@ class Denoiser(nn.Module):
     @torch.no_grad()
     def generate(self, img_shape: Tuple[int, int], batch_size: int) -> torch.Tensor:
         """
-        Generates random batch_size samples from the distribution.
+        Generates batch_size random samples from the distribution.
         :argument img_shape: Shape of images
         :argument batch_size: Number of samples
         :returns samples: Tensor of shape (batch, img_channels, *img_shape)
