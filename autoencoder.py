@@ -324,7 +324,6 @@ class AutoEncoder(nn.Module):
     
             metadata = f.metadata()
 
-        print(metadata)
         multipliers = tuple(int(el.strip()) for el in metadata["multipliers"][1:-1].split(","))
         down_sample = tuple(el.strip() == "True" for el in metadata["down_sample"][1:-1].split(","))
         model = AutoEncoder(data_channels=int(metadata["data_channels"]),
@@ -403,7 +402,19 @@ class EncodedImgDataset(Dataset):
         sub_i = idx % self._chunk_size
         batch_img, batch_label = self._get_chunk(chunk_i)
 
-        if idx not in self._filled_idx:
+        img, label = batch_img[sub_i], batch_label[sub_i]
+
+        if idx in self._filled_idx:
+            # We know this index has been filled 
+            return img, label
+
+        if not torch.all(img == 0.0):
+            # This index has been filled on some different run of the program, since it holds non-zero data
+            self._filled_idx.add(idx)
+            return img, label
+        else:
+            # This index is empty.
+            # Get the relevant encoding and save the data
             img, label = self._base_dataset[idx]
             with torch.no_grad():
                 batch_img[sub_i] = self._autoencoder.encode(img.to(self._device)[None, ...]).cpu().squeeze(0)
@@ -411,7 +422,7 @@ class EncodedImgDataset(Dataset):
             self._filled_idx.add(idx)
             self._save_chunk(chunk_i, batch_img, batch_label)
 
-        return batch_img[sub_i], batch_label[sub_i]
+            return batch_img[sub_i], batch_label[sub_i]
 
 
 def _test_autoencoder():
