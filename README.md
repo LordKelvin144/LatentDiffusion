@@ -3,12 +3,13 @@ This project is a reproduction and exploration of the latent diffusion framework
 
 The aim is to provide a simple PyTorch implementation capable of realistic image generation.
 
-Note that this is a work in progress. Currently the code comprises
-- An end-to-end implementation of the latent diffusion pipeline for image generation
-- Training autoencoders, using variational KL-divergence regularization (similar to a VAE) and a GAN-type loss based on a patch-based discriminator
-- Unconditional image generation based on the [CelebA dataset](https://mmlab.ie.cuhk.edu.hk/projects/CelebA.html)
-- A simplified UNet architecture without attention blocks (these blocks will be added in the future)
+Note that this is a work in progress. Currently the code comprises the following parts:
+- An end-to-end implementation of the latent diffusion pipeline for image generation.
+- Training of autoencoders, using VAE regularization and a GAN-type loss with a patch discriminator.
+- Unconditional image generation based on the [CelebA dataset](https://mmlab.ie.cuhk.edu.hk/projects/CelebA.html).
 - As a baseline and sanity check, a diffusion-only model for generating MNIST digits.
+
+Note that the UNet architecture currently implemented differs from the paper in that it does not include any attention blocks. These will be added in the future, along with the possibility for conditional generation.
 
 ## Sample outputs
 <img alt="Generated images when training on the CelebA dataset" width=1000 src="example_results/generated_faces_epoch10.jpg">
@@ -28,19 +29,19 @@ Sample from the same model as the previous figure, but using a lower $\sigma$ at
 
 <img alt="Image of generated MNIST digits" width=1000 src="example_results/generated_mnist.jpg">
 
-Sample outputs from a simple DDPM trained on MNIST
+Sample outputs from a simple DDPM trained on MNIST.
 
 ## Overview
 The basic training pipeline consists in the following steps
 
-1. **Train an autoencoder** whose task is to compress the image data into a lower-dimensional latent space. This uses a combination of an l2 reconstruction loss, a KL-divergence regularization (like a Variational Auto-Encoder) to maintain a standard scaling of the latent space, and a GAN-based loss using a patch-based discriminator to promote high image fidelity.
-2. **Construct a dataset of encoded images.** To save time thile training the denoiser, a dataset of encoded versions of all images in the dataset is cached to disk. This saves inference time needed to do the encoding at the expense of higher disk usage.
+1. **Train an autoencoder** whose task is to compress the image data into a lower-dimensional latent space. My implementation follows the VAE formulation in the latent diffusion paper. It uses an l2 reconstruction loss, a VAE-type regularization and a GAN-type loss to improve image fidelity. The latter uses a patch-based discriminator which is trained adversarily. 
+2. **Construct a dataset of encoded images.** To save time while training the denoiser, a dataset of encoded versions of all images in the dataset is cached to disk. This speeds up training as the inference required for encoding is replaced with reading the cached encoding, which is generally much faster. However, this comes at the cost of higher disk usage.
 3. **Train a denoiser** to do epsilon-prediction in the latent space.
 
 At generation time the process is
 
-1. Sample latent noise from a standard normal distribution
-2. Do DDPM sampling with the denoiser to reconstruct a latent code corresponding to a realistic image
+1. Sample latent noise from a standard normal distribution.
+2. Do DDPM sampling with the denoiser to reconstruct a latent code corresponding to a realistic image.
 3. Decode the latent representation into an image.
 
 ## Running
@@ -96,5 +97,4 @@ python3 latent_diffusion.py \
     --encoder checkpoints/autoencoder/AAA.safetensors
 ```
 The generated images are shown directly to the user and also saved to `fig/denoiser/`
-
 
